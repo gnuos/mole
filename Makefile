@@ -1,15 +1,17 @@
+.PHONY: test cover build bin test-env rm-test-env site
+
 LDFLAGS := -X main.version=$(version)
 
 test:
 ifneq ($(shell go fmt ./...),)
 	$(error code not formatted. Please run 'go fmt')
 endif
-	@go test ./... -v -race -coverprofile=coverage.txt -covermode=atomic
+	@go test github.com/davrodpin/mole/... -v -race -coverprofile=coverage.txt -covermode=atomic
 cover: test
 	go tool cover -html=coverage.txt
 
-install:
-	@go install github.com/davrodpin/mole/cmd/mole
+build:
+	@go build github.com/davrodpin/mole/cmd/mole
 
 bin:
 ifeq ($(version),)
@@ -19,6 +21,12 @@ endif
 	cd bin && tar c mole | gzip > mole$(version).darwin-amd64.tar.gz && rm mole && cd -
 	GOOS=linux GOARCH=amd64 go build -o bin/mole -ldflags "$(LDFLAGS)" github.com/davrodpin/mole/cmd/mole
 	cd bin && tar c mole | gzip > mole$(version).linux-amd64.tar.gz && rm mole && cd -
+	GOOS=linux GOARCH=arm go build -o bin/mole -ldflags "$(LDFLAGS)" github.com/davrodpin/mole/cmd/mole
+	cd bin && tar c mole | gzip > mole$(version).linux-arm.tar.gz && rm mole && cd -
+	GOOS=linux GOARCH=arm64 go build -o bin/mole -ldflags "$(LDFLAGS)" github.com/davrodpin/mole/cmd/mole
+	cd bin && tar c mole | gzip > mole$(version).linux-arm64.tar.gz && rm mole && cd -
+	GOOS=windows GOARCH=amd64 go build -o bin/mole.exe -ldflags "$(LDFLAGS)" github.com/davrodpin/mole/cmd/mole
+	cd bin && zip mole$(version).windows-amd64.zip mole.exe && rm -f mole.exe && cd -
 
 add-network:
 	-@docker network create --subnet=192.168.33.0/24 mole
@@ -51,6 +59,8 @@ mole-ssh: rm-mole-ssh
 		--name mole_ssh mole_ssh:latest
 
 test-env: add-network mole-http mole-ssh
-	@bash test-env/provision.sh
 
 rm-test-env: rm-mole-http rm-mole-ssh rm-network
+
+site:
+	cd docs/ && bundle install && bundle exec jekyll serve

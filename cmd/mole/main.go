@@ -3,20 +3,25 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
+	"syscall"
 
+	"github.com/awnumar/memguard"
 	"github.com/davrodpin/mole/cli"
 	"github.com/davrodpin/mole/storage"
 	"github.com/davrodpin/mole/tunnel"
-	uuid "github.com/satori/go.uuid"
+	"github.com/gofrs/uuid"
 	daemon "github.com/sevlyar/go-daemon"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 var version = "unversioned"
 var instancesDir string
 
 func main() {
+	// memguard is used to securely keep sensitive information in memory.
+	// This call makes sure all data will be destroy when the program exits.
+	defer memguard.Purge()
 
 	app := cli.New(os.Args)
 	err := app.Parse()
@@ -26,9 +31,16 @@ func main() {
 		app.PrintUsage()
 		os.Exit(1)
 	}
+
 	log.SetOutput(os.Stdout)
 
-	instancesDir = fmt.Sprintf("%s/.mole/instances", os.Getenv("HOME"))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Errorf("error starting mole: %v", err)
+		os.Exit(1)
+	}
+
+	instancesDir = fmt.Sprintf("%s/.mole/instances", home)
 
 	err = createInstancesDir()
 	if err != nil {
@@ -42,7 +54,7 @@ func main() {
 	case "version":
 		fmt.Printf("mole %s\n", version)
 	case "start":
-		err := start(*app)
+		err := start(app)
 		if err != nil {
 			os.Exit(1)
 		}
@@ -67,7 +79,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "aliases":
-		err := lsAliases(*app)
+		err := lsAliases()
 		if err != nil {
 			os.Exit(1)
 		}
@@ -173,7 +185,15 @@ func startFromAlias(app cli.App) error {
 		return err
 	}
 
-	appFromAlias := alias2app(conf)
+	appFromAlias, err := alias2app(conf)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"alias": app.Alias,
+		}).Errorf("error starting mole: %v", err)
+
+		return err
+	}
+
 	appFromAlias.Alias = app.Alias
 	// if use -detach when -start but none -detach in storage
 	if app.Detach {
@@ -183,13 +203,18 @@ func startFromAlias(app cli.App) error {
 	return start(appFromAlias)
 }
 
-func start(app cli.App) error {
+func start(app *cli.App) error {
 	if app.Detach {
 		var alias string
 		if app.Alias != "" {
 			alias = app.Alias
 		} else {
-			alias = uuid.Must(uuid.NewV4()).String()[:8]
+			u, err := uuid.NewV4()
+			if err != nil {
+				log.Errorf("error could not generate uuid: %v", err)
+				return err
+			}
+			alias = u.String()[:8]
 		}
 		err := startDaemonProcess(alias)
 		if err != nil {
@@ -199,6 +224,7 @@ func start(app cli.App) error {
 			return err
 		}
 	}
+
 	if app.Verbose {
 		log.SetLevel(log.DebugLevel)
 	}
@@ -207,16 +233,60 @@ func start(app cli.App) error {
 		"options": app.String(),
 	}).Debug("cli options")
 
-	s, err := tunnel.NewServer(app.Server.User, app.Server.Address(), app.Key)
+	s, err := tunnel.NewServer(app.Server.User, app.Server.Address(), app.Key, app.SSHAgent)
 	if err != nil {
 		log.Errorf("error processing server options: %v\n", err)
 
 		return err
 	}
 
+	s.Insecure = app.Insecure
+	s.Timeout = app.Timeout
+
+	s.Key.HandlePassphrase(func() ([]byte, error) {
+		fmt.Printf("The key provided is secured by a password. Please provide it below:\n")
+		fmt.Printf("Password: ")
+		p, err := terminal.ReadPassword(int(syscall.Stdin))
+		fmt.Printf("\n")
+		return p, err
+	})
+
 	log.Debugf("server: %s", s)
 
-	t := tunnel.New(app.Local.String(), s, app.Remote.String())
+	local := make([]string, len(app.Local))
+	for i, r := range app.Local {
+		local[i] = r.String()
+	}
+
+	remote := make([]string, len(app.Remote))
+	for i, r := range app.Remote {
+		if r.Port == "" {
+			err := fmt.Errorf("missing port in remote address: %s", r.String())
+			log.Error(err)
+			return err
+		}
+
+		remote[i] = r.String()
+	}
+
+	channels, err := tunnel.BuildSSHChannels(s.Name, local, remote)
+	if err != nil {
+		return err
+	}
+
+	t, err := tunnel.New(s, channels)
+	if err != nil {
+		log.Errorf("%v", err)
+		return err
+	}
+
+	//TODO need to find a way to require the attributes below to be always set
+	// since they are not optional (functionality will break if they are not
+	// set and CLI parsing is the one setting the default values).
+	// That could be done by make them required in the constructor's signature
+	t.ConnectionRetries = app.ConnectionRetries
+	t.WaitAndRetry = app.WaitAndRetry
+	t.KeepAliveInterval = app.KeepAliveInterval
 
 	if err = t.Start(); err != nil {
 		log.WithFields(log.Fields{
@@ -231,7 +301,6 @@ func start(app cli.App) error {
 
 func newAlias(app cli.App) error {
 	_, err := storage.Save(app.Alias, app2alias(app))
-
 	if err != nil {
 		log.WithFields(log.Fields{
 			"alias": app.Alias,
@@ -250,56 +319,4 @@ func rmAlias(app cli.App) error {
 	}
 
 	return nil
-}
-
-func lsAliases(app cli.App) error {
-	tunnels, err := storage.FindAll()
-	if err != nil {
-		return err
-	}
-
-	aliases := []string{}
-	for alias := range tunnels {
-		aliases = append(aliases, alias)
-	}
-
-	fmt.Printf("alias list: %s\n", strings.Join(aliases, ", "))
-
-	return nil
-}
-
-func app2alias(app cli.App) *storage.Tunnel {
-	return &storage.Tunnel{
-		Local:   app.Local.String(),
-		Remote:  app.Remote.String(),
-		Server:  app.Server.String(),
-		Key:     app.Key,
-		Verbose: app.Verbose,
-		Help:    app.Help,
-		Version: app.Version,
-		Detach:  app.Detach,
-	}
-}
-
-func alias2app(t *storage.Tunnel) cli.App {
-	local := cli.HostInput{}
-	local.Set(t.Local)
-
-	remote := cli.HostInput{}
-	remote.Set(t.Remote)
-
-	server := cli.HostInput{}
-	server.Set(t.Server)
-
-	return cli.App{
-		Command: "start",
-		Local:   local,
-		Remote:  remote,
-		Server:  server,
-		Key:     t.Key,
-		Verbose: t.Verbose,
-		Help:    t.Help,
-		Version: t.Version,
-		Detach:  t.Detach,
-	}
 }

@@ -19,7 +19,13 @@ type SSHConfigFile struct {
 // NewSSHConfigFile creates a new instance of SSHConfigFile based on the
 // ssh config file from $HOME/.ssh/config.
 func NewSSHConfigFile() (*SSHConfigFile, error) {
-	configPath := filepath.Join(os.Getenv("HOME"), ".ssh", "config")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	configPath := filepath.Join(home, ".ssh", "config")
+
 	f, err := os.Open(filepath.Clean(configPath))
 	if err != nil {
 		return nil, err
@@ -33,6 +39,11 @@ func NewSSHConfigFile() (*SSHConfigFile, error) {
 	log.Debugf("using ssh config file from: %s", configPath)
 
 	return &SSHConfigFile{sshConfig: cfg}, nil
+}
+
+func NewEmptySSHConfigStruct() *SSHConfigFile {
+	log.Debugf("generating an empty config struct")
+	return &SSHConfigFile{sshConfig: &ssh_config.Config{}}
 }
 
 // Get consults a ssh config file to extract some ssh server attributes
@@ -53,18 +64,23 @@ func (r SSHConfigFile) Get(host string) *SSHHost {
 
 	localForward, err := r.getLocalForward(host)
 	if err != nil {
-		localForward = &LocalForward{Local: "", Remote: ""}
-		log.Warningf("error reading LocalForward configuration from ssh config file. This option will not be used: %v", err)
+		log.Warningf("error reading LocalForward configuration from ssh config file: %v", err)
 	}
 
 	key := r.getKey(host)
 
+	identityAgent, err := r.sshConfig.Get(host, "IdentityAgent")
+	if err != nil {
+		identityAgent = ""
+	}
+
 	return &SSHHost{
-		Hostname:     hostname,
-		Port:         port,
-		User:         user,
-		Key:          key,
-		LocalForward: localForward,
+		Hostname:      hostname,
+		Port:          port,
+		User:          user,
+		Key:           key,
+		IdentityAgent: identityAgent,
+		LocalForward:  localForward,
 	}
 }
 
@@ -86,7 +102,7 @@ func (r SSHConfigFile) getLocalForward(host string) (*LocalForward, error) {
 	}
 
 	if c == "" {
-		return &LocalForward{Local: "", Remote: ""}, nil
+		return nil, nil
 	}
 
 	l := strings.Fields(c)
@@ -130,16 +146,17 @@ func (r SSHConfigFile) getKey(host string) string {
 
 // SSHHost represents a host configuration extracted from a ssh config file.
 type SSHHost struct {
-	Hostname     string
-	Port         string
-	User         string
-	Key          string
-	LocalForward *LocalForward
+	Hostname      string
+	Port          string
+	User          string
+	Key           string
+	IdentityAgent string
+	LocalForward  *LocalForward
 }
 
 // String returns a string representation of a SSHHost.
 func (h SSHHost) String() string {
-	return fmt.Sprintf("[hostname=%s, port=%s, user=%s, key=%s, local_forward=%s]", h.Hostname, h.Port, h.User, h.Key, h.LocalForward)
+	return fmt.Sprintf("[hostname=%s, port=%s, user=%s, key=%s, identity_agent=%s, local_forward=%s]", h.Hostname, h.Port, h.User, h.Key, h.IdentityAgent, h.LocalForward)
 }
 
 // LocalForward represents a LocalForward configuration for SSHHost.
